@@ -34,26 +34,17 @@
 C4Container
     title Диаграмма контейнеров — LocalScript (Уровень 2)
 
-    Person(user, "Пользователь", "Разработчик LowCode-платформы. Формулирует задачу на русском языке и ожидает готовый Lua-скрипт.")
+    Person(user, "Пользователь", "Разработчик LowCode")
 
-    System_Boundary(localscript, "LocalScript (единый docker compose)") {
-        Container(app, "FastAPI-приложение", "Python 3.11, FastAPI, uvicorn, httpx", "Принимает POST /generate, оркестрирует агентный цикл: поиск примеров → генерация → валидация → самокоррекция.")
-
-        Container(ollama, "Сервер Ollama", "Docker-контейнер, NVIDIA GPU", "Хостит квантованную модель qwen2.5-coder:7b-instruct-q4_K_M (~4.7 ГБ VRAM). Отдаёт ответы через /api/chat.")
-
-        Container(luac, "Валидатор luac", "Локальный процесс Lua 5.4", "Дочерний процесс, запускаемый FastAPI через subprocess. Проверяет синтаксис сгенерированного кода командой luac -p.")
+    System_Boundary(localscript, "LocalScript (docker compose)") {
+        Container(app, "FastAPI-приложение", "Python 3.11", "Агентный цикл: поиск, генерация, валидация, самокоррекция")
+        Container(ollama, "Сервер Ollama", "GPU, Q4", "qwen2.5-coder:7b, ~4.7 ГБ VRAM")
+        Container(luac, "Валидатор luac", "Lua 5.4", "Проверка синтаксиса через luac -p")
     }
 
-    Rel(user, app, "Отправляет промпт на естественном языке", "HTTP POST /generate (JSON)")
-    Rel(app, ollama, "Запрашивает генерацию кода с историей диалога", "HTTP POST /api/chat")
-    Rel(app, luac, "Передаёт Lua-код на проверку через stdin", "subprocess.run")
-    Rel(ollama, app, "Возвращает сгенерированный Lua-код", "HTTP JSON")
-    Rel(luac, app, "Возвращает стёрр с ошибкой или код возврата 0", "stdout / stderr")
-    Rel(app, user, "Возвращает валидный Lua-код", "HTTP JSON")
-
-    UpdateRelStyle(user, app, $offsetX="-40", $offsetY="-20")
-    UpdateRelStyle(app, ollama, $offsetX="10", $offsetY="-10")
-    UpdateRelStyle(app, luac, $offsetX="10", $offsetY="10")
+    Rel(user, app, "Промпт на русском", "HTTP POST /generate")
+    Rel(app, ollama, "Чат с историей", "HTTP /api/chat")
+    Rel(app, luac, "Код на stdin", "subprocess.run")
 ```
 
 ---
@@ -94,39 +85,26 @@ C4Container
 C4Component
     title Диаграмма компонентов — FastAPI-приложение (Уровень 3)
 
-    Person(user, "Пользователь", "Разработчик LowCode-платформы")
+    Person(user, "Пользователь", "Разработчик LowCode")
 
-    Container_Boundary(app, "FastAPI-приложение (контейнер app)") {
-        Component(main, "main.py", "FastAPI, Pydantic", "Входная точка HTTP. Определяет POST /generate и GET /health, управляет жизненным циклом OllamaClient через lifespan, оборачивает исключения в HTTPException.")
-
-        Component(agent, "agent.py", "Python async", "Агентный цикл самокоррекции. Строит историю диалога, вызывает LLM при temperature=0.1, при синтаксической ошибке повторяет с temperature=0.5 и добавленным фидбеком (до 2 ретраев).")
-
-        Component(knowledge, "knowledge.py", "rank-bm25, dataclasses", "База знаний: 10 правил LowCode + 10 few-shot примеров (включая anti-examples). BM25-поиск top-2 релевантных примеров и сборка системного промпта с защитой от превышения бюджета токенов (~2500).")
-
-        Component(validator, "lua_validator.py", "re, subprocess", "Извлечение Lua-кода из ответа LLM (lua{...}lua → markdown-фенсы → fallback). Синтаксическая проверка через дочерний процесс luac -p.")
-
-        Component(ollama_client, "ollama_client.py", "httpx.AsyncClient", "Асинхронный HTTP-клиент Ollama. Вызывает /api/chat со всей историей сообщений, /api/tags для проверки здоровья, управляет таймаутом 300 секунд.")
+    Container_Boundary(app, "FastAPI-приложение") {
+        Component(main, "main.py", "FastAPI", "HTTP-эндпоинты, lifespan")
+        Component(agent, "agent.py", "async", "Цикл самокоррекции, retry")
+        Component(knowledge, "knowledge.py", "rank-bm25", "BM25 top-2, бюджет токенов")
+        Component(validator, "lua_validator.py", "subprocess", "Извлечение и валидация кода")
+        Component(ollama_client, "ollama_client.py", "httpx", "HTTP-клиент Ollama")
     }
 
-    System_Ext(ollama_ext, "Ollama-сервер", "Docker-контейнер с qwen2.5-coder на GPU")
-    System_Ext(luac_ext, "Компилятор luac", "Локальный процесс Lua 5.4")
+    System_Ext(ollama_ext, "Ollama-сервер", "GPU, qwen2.5-coder")
+    System_Ext(luac_ext, "Компилятор luac", "Lua 5.4")
 
-    Rel(user, main, "POST /generate с JSON {prompt}", "HTTP")
-    Rel(main, agent, "Вызывает generate(prompt, client)", "Python async")
-
-    Rel(agent, knowledge, "Просит top-2 примера и собранный системный промпт", "select_examples, build_system_prompt")
-    Rel(agent, ollama_client, "Отправляет полную историю чата с температурой", "chat(history, temperature)")
-    Rel(agent, validator, "Извлекает код и проверяет синтаксис", "extract_lua_code, validate_lua")
-
-    Rel(ollama_client, ollama_ext, "Запрашивает генерацию", "HTTP POST /api/chat")
-    Rel(validator, luac_ext, "Передаёт код на stdin и читает ошибки", "subprocess luac -p -")
-
-    Rel(main, user, "Возвращает JSON {code}", "HTTP 200")
-
-    UpdateRelStyle(user, main, $offsetX="-20", $offsetY="-10")
-    UpdateRelStyle(agent, knowledge, $offsetX="-30", $offsetY="0")
-    UpdateRelStyle(agent, ollama_client, $offsetX="10", $offsetY="-10")
-    UpdateRelStyle(agent, validator, $offsetX="10", $offsetY="10")
+    Rel(user, main, "POST /generate", "HTTP")
+    Rel(main, agent, "generate()", "async")
+    Rel(agent, knowledge, "top-2 + prompt")
+    Rel(agent, ollama_client, "chat(history)")
+    Rel(agent, validator, "extract + validate")
+    Rel(ollama_client, ollama_ext, "/api/chat", "HTTP")
+    Rel(validator, luac_ext, "luac -p", "subprocess")
 ```
 
 ---
