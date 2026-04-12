@@ -10,9 +10,13 @@ log = logging.getLogger(__name__)
 # Type alias for the chat message list passed to /api/chat
 Message = dict[str, str]
 
+# Hackathon-fixed parameters: num_ctx=4096, num_predict=256, batch=1, parallel=1.
+# `num_parallel` is controlled at server level via OLLAMA_NUM_PARALLEL=1 in
+# docker-compose.yml — it is not a per-request option.
 BASE_OPTIONS: dict[str, Any] = {
     "num_ctx": 4096,
-    "num_predict": 1024,
+    "num_predict": 256,
+    "num_batch": 1,
 }
 
 
@@ -27,23 +31,38 @@ class OllamaClient:
         messages: list[Message],
         temperature: float = 0.1,
         extra_options: dict[str, Any] | None = None,
+        format: str | None = None,
     ) -> str:
-        """Call /api/chat with a full message history and return assistant text."""
+        """Call /api/chat with a full message history and return assistant text.
+
+        Parameters
+        ----------
+        extra_options : optional per-request override for Ollama options
+            (e.g. {"num_predict": 80} for a short classifier call). Merged on
+            top of BASE_OPTIONS so the hackathon-fixed defaults win unless
+            explicitly overridden.
+        format : optional Ollama response-format constraint. Pass "json" to
+            force the model to emit a valid JSON object — used by the
+            Clarification Agent.
+        """
         options: dict[str, Any] = {**BASE_OPTIONS, "temperature": temperature}
         if extra_options:
             options.update(extra_options)
 
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": False,
             "options": options,
         }
+        if format is not None:
+            payload["format"] = format
         log.debug(
-            "Ollama chat: model=%s messages=%d temp=%.2f",
+            "Ollama chat: model=%s messages=%d temp=%.2f format=%s",
             self.model,
             len(messages),
             temperature,
+            format,
         )
         resp = await self._client.post("/api/chat", json=payload)
         resp.raise_for_status()

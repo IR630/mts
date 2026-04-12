@@ -6,8 +6,18 @@ import logging
 
 log = logging.getLogger(__name__)
 
-# Regex patterns for code extraction (ordered by priority)
-_LUA_DELIM_RE = re.compile(r"lua\{(.*?)\}lua", re.DOTALL)
+# Regex patterns for code extraction (ordered by priority).
+#
+# Strict form: require a newline after `lua{` and before `}lua`. This
+# prevents matching inline prose references to the wrapper (e.g. when the
+# model writes "обёрнут в lua{}lua" in a Валидация line) — such inline
+# mentions would otherwise cause a lazy `.*?` match to span from the prose
+# `lua{` to a much later real `}lua`, polluting the capture with free text.
+#
+# Loose form: used as a fallback for single-line wrappers like
+# `lua{ return 1 }lua`.
+_LUA_DELIM_STRICT_RE = re.compile(r"lua\{[^\S\n]*\n(.*?)\n[^\S\n]*\}lua", re.DOTALL)
+_LUA_DELIM_LOOSE_RE = re.compile(r"lua\{(.*?)\}lua", re.DOTALL)
 _MD_BLOCK_RE = re.compile(r"```(?:lua)?\s*\n?(.*?)```", re.DOTALL)
 
 # Keywords that can legally start a Lua chunk
@@ -15,18 +25,33 @@ _CHUNK_STARTERS = ("if", "for", "while", "repeat", "local", "return", "function"
 
 
 def extract_lua_code(response: str) -> str:
-    """Extract Lua code from the LLM response, trying several formats."""
-    # 1. lua{...}lua delimiters
-    m = _LUA_DELIM_RE.search(response)
-    if m:
-        return m.group(1).strip()
+    """Extract Lua code from the LLM response, trying several formats.
 
-    # 2. Markdown code block
+    Tries, in order:
+      1. A strict multi-line ``lua{ \\n ... \\n }lua`` block — picks the LAST
+         match so that any earlier prose reference to the wrapper (e.g. in a
+         Валидация line) does not pollute the capture.
+      2. A loose single-line ``lua{ ... }lua`` block — also picks the last
+         match.
+      3. A markdown code fence (```lua ... ```).
+      4. Raw stripped response.
+    """
+    # 1. Strict lua{\n...\n}lua (multi-line) — take the LAST match.
+    matches = _LUA_DELIM_STRICT_RE.findall(response)
+    if matches:
+        return matches[-1].strip()
+
+    # 2. Loose lua{...}lua — take the LAST match.
+    matches = _LUA_DELIM_LOOSE_RE.findall(response)
+    if matches:
+        return matches[-1].strip()
+
+    # 3. Markdown code block
     m = _MD_BLOCK_RE.search(response)
     if m:
         return m.group(1).strip()
 
-    # 3. Fallback — raw response stripped of leading/trailing whitespace
+    # 4. Fallback — raw response stripped of leading/trailing whitespace
     code = response.strip()
 
     # Strip leftover markdown fences if present at start/end

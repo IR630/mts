@@ -1,10 +1,14 @@
 # Архитектура LocalScript (C4-модель)
 
 Документ описывает архитектуру системы **LocalScript** — локального
-агентного генератора Lua-кода для LowCode-платформы — на двух уровнях
+агентного генератора Lua 5.5-кода для LowCode-платформы — на двух уровнях
 модели C4: **Container Diagram (Уровень 2)** и **Component Diagram
 (Уровень 3)**. Диаграммы написаны на Mermaid.js и отображаются прямо в
 браузере (GitHub, VS Code, MkDocs и т. п.).
+
+Фиксированные параметры запуска жюри: `num_ctx=4096`, `num_predict=256`,
+`num_batch=1`, `OLLAMA_NUM_PARALLEL=1`. Пиковое потребление VRAM — ≤ 8 ГБ
+(замер через `nvidia-smi` или эндпоинт `/metrics`).
 
 ---
 
@@ -23,12 +27,11 @@
    директивой `OLLAMA_NUM_PARALLEL=1`, что не даёт движку дублировать
    веса под конкурентные запросы и вписывает систему в лимит 8 ГБ даже
    на RTX 3060 / 4060.
-3. **Автономная самокоррекция.** Валидатор `luac` — это не отдельный
-   сервис и не облачный линтер, а локальный дочерний процесс, который
-   FastAPI-контейнер запускает через `subprocess`. Благодаря этому
-   агент может мгновенно (без сетевых задержек) получить обратную связь
-   о синтаксической ошибке и передать её обратно в LLM внутри одного
-   HTTP-запроса пользователя.
+3. **Автономная самокоррекция.** Валидатор `luac` и runtime sandbox —
+   это локальные дочерние процессы, которые FastAPI-контейнер запускает
+   через `subprocess`. Благодаря этому агент мгновенно (без сетевых
+   задержек) получает обратную связь об ошибках и передаёт их обратно
+   в LLM внутри одного HTTP-запроса пользователя.
 
 ```mermaid
 C4Container
@@ -37,49 +40,58 @@ C4Container
     Person(user, "Пользователь", "Разработчик LowCode")
 
     System_Boundary(localscript, "LocalScript (docker compose)") {
-        Container(app, "FastAPI-приложение", "Python 3.11", "Агентный цикл: поиск, генерация, валидация, самокоррекция")
+        Container(ui, "Web UI", "HTML/JS", "Чат-интерфейс с отображением плана и телеметрии")
+        Container(app, "FastAPI-приложение", "Python 3.11", "Clarifier → Planner → Coder → Validator → Self-correction")
         Container(ollama, "Сервер Ollama", "GPU, Q4", "qwen2.5-coder:7b, ~4.7 ГБ VRAM")
-        Container(luac, "Валидатор luac", "Lua 5.4", "Проверка синтаксиса через luac -p")
+        Container(luac, "Валидатор luac", "Lua 5.4", "Синтаксис через luac -p")
+        Container(sandbox, "Runtime Sandbox", "Lua 5.4", "Исполнение с mock wf.vars")
     }
 
-    Rel(user, app, "Промпт на русском", "HTTP POST /generate")
+    Rel(user, ui, "Задачи на RU/EN", "HTTP /ui")
+    Rel(ui, app, "JSON API", "HTTP /session/*/message")
     Rel(app, ollama, "Чат с историей", "HTTP /api/chat")
-    Rel(app, luac, "Код на stdin", "subprocess.run")
+    Rel(app, luac, "Код на stdin", "subprocess")
+    Rel(app, sandbox, "Код + mock", "subprocess")
 ```
 
 ---
 
 ## Уровень 3 — Component Diagram (внутренности FastAPI-приложения)
 
-Эта диаграмма показывает, как пять модулей внутри `app/` распределяют
-между собой три ключевые обязанности агента и как именно они удерживают
-систему в рамках хакатонных ограничений:
+Эта диаграмма показывает, как семь модулей внутри `app/` распределяют
+между собой ключевые обязанности агента:
 
-1. **Целевой BM25-поиск против разрастания контекста.** Модуль
-   `knowledge.py` держит корпус из 10 few-shot примеров (включая два
-   anti-example для JsonPath и sandbox-escape). На каждый запрос BM25
-   выбирает только top-2 наиболее релевантных — остальные в системный
-   промпт не попадают. Дополнительно `build_system_prompt` считает
-   приблизительное число токенов (`chars // 4`) и, если промпт
-   приближается к бюджету `MAX_SYSTEM_PROMPT_TOKENS = 2500`, **сам
-   выкидывает** лишние примеры, не давая превысить `num_ctx = 4096`
-   модели. Это прямой механизм защиты от переполнения VRAM на
-   карточках до 8 ГБ.
-2. **Автономный цикл самокоррекции.** Модуль `agent.py` держит полную
-   `history` из сообщений чата. После первой генерации при
-   `temperature = 0.1` результат извлекается через `lua_validator.py`
-   (`extract_lua_code` умеет разбирать `lua{...}lua`, markdown-фенсы и
-   голый текст) и прогоняется через `validate_lua` → `luac -p`. При
-   ошибке цикл добавляет в `history` сломанный ответ ассистента и
-   корректирующее сообщение пользователя, поднимает температуру до
-   `0.5` и повторяет — до двух раз. Это *в точности* то, что требовал
-   хакатон: агент, который сам чинит свои ошибки, без участия человека.
-3. **Полная изоляция инфраструктуры от бизнес-логики.** Модуль
-   `ollama_client.py` — единственная точка, знающая про HTTP и httpx.
-   Модуль `lua_validator.py` — единственная точка, знающая про
-   `subprocess` и `luac`. `main.py` не импортирует ни то, ни другое
-   напрямую — только `agent.generate(...)`, что делает код легко
-   тестируемым и позволяет подменять инфраструктурные зависимости.
+1. **Clarification Agent (`clarifier.py`).** Классификатор на основе
+   LLM с `format: "json"` и `num_predict: 80`. Анализирует, достаточно
+   ли конкретна задача для генерации, или нужен уточняющий вопрос.
+   Безопасные/адверсариальные запросы (`io.open`, JsonPath) никогда не
+   триггерят clarification — они идут напрямую к агенту.
+
+2. **Planner (`agent.py::_plan`).** Лёгкий LLM-вызов с `num_predict: 120`,
+   генерирующий 2-4 пункта плана перед кодированием. Это chain-of-thought
+   для 7B-модели: она лучше генерирует код, когда сначала описывает подход.
+   План виден пользователю в UI и API.
+
+3. **BM25 Few-shot Retrieval (`knowledge.py`).** 30 примеров с RU/EN
+   ключевыми словами, включая 2 anti-example (JsonPath, sandbox-escape).
+   BM25 выбирает top-2 на каждый запрос. Token-budget guard автоматически
+   выкидывает лишние примеры, чтобы не превысить `num_ctx=4096`.
+
+4. **Schema Inference (`knowledge.py::infer_schema`).** Если пользователь
+   передал `sample_wf_vars`, система рекурсивно обходит структуру и
+   генерирует список доступных путей (`wf.vars.response.data.status : string`).
+   Это заземляет генерацию — модель перестаёт галлюцинировать поля.
+
+5. **Two-stage Validation.** Синтаксис через `luac -p`, затем runtime через
+   `lua` с sandbox-преамбулой (mock `wf.vars`, запрещённые globals = nil).
+
+6. **Self-correction Loop.** До 2 ретраёв с temperature escalation
+   (0.1 → 0.5). Ошибки обеих стадий валидации подаются обратно в модель.
+
+7. **Multi-turn Refinement.** Сессионный API хранит историю. Если в
+   сессии уже есть код, следующий запрос пользователя трактуется как
+   refinement: предыдущий код включается в промпт, и модель модифицирует
+   его.
 
 ```mermaid
 C4Component
@@ -88,32 +100,94 @@ C4Component
     Person(user, "Пользователь", "Разработчик LowCode")
 
     Container_Boundary(app, "FastAPI-приложение") {
-        Component(main, "main.py", "FastAPI", "HTTP-эндпоинты, lifespan")
-        Component(agent, "agent.py", "async", "Цикл самокоррекции, retry")
-        Component(knowledge, "knowledge.py", "rank-bm25", "BM25 top-2, бюджет токенов")
-        Component(validator, "lua_validator.py", "subprocess", "Извлечение и валидация кода")
+        Component(main, "main.py", "FastAPI", "HTTP-эндпоинты, сессии, lifespan")
+        Component(clarifier, "clarifier.py", "LLM JSON classifier", "Уточняющие вопросы")
+        Component(agent, "agent.py", "async", "Planner + Coder + Retry loop")
+        Component(knowledge, "knowledge.py", "rank-bm25", "30 примеров, BM25, schema inference")
+        Component(lua_val, "lua_validator.py", "subprocess", "Извлечение кода + luac -p")
+        Component(runtime_val, "runtime_validator.py", "subprocess", "Lua sandbox с mock wf")
         Component(ollama_client, "ollama_client.py", "httpx", "HTTP-клиент Ollama")
     }
 
     System_Ext(ollama_ext, "Ollama-сервер", "GPU, qwen2.5-coder")
     System_Ext(luac_ext, "Компилятор luac", "Lua 5.4")
+    System_Ext(lua_ext, "Интерпретатор lua", "Lua 5.4")
 
-    Rel(user, main, "POST /generate", "HTTP")
-    Rel(main, agent, "generate()", "async")
-    Rel(agent, knowledge, "top-2 + prompt")
-    Rel(agent, ollama_client, "chat(history)")
-    Rel(agent, validator, "extract + validate")
+    Rel(user, main, "POST /session/*/message", "HTTP")
+    Rel(main, clarifier, "analyze(prompt)")
+    Rel(main, agent, "generate(prompt, previous_code, schema)")
+    Rel(agent, knowledge, "select_examples + build_prompt + infer_schema")
+    Rel(agent, ollama_client, "chat(history) — plan + code")
+    Rel(agent, lua_val, "extract + validate_lua")
+    Rel(agent, runtime_val, "validate_runtime")
     Rel(ollama_client, ollama_ext, "/api/chat", "HTTP")
-    Rel(validator, luac_ext, "luac -p", "subprocess")
+    Rel(lua_val, luac_ext, "luac -p", "subprocess")
+    Rel(runtime_val, lua_ext, "lua -e", "subprocess")
+```
+
+---
+
+## Полный Pipeline (последовательность вызовов)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as Web UI
+    participant API as main.py
+    participant CL as clarifier.py
+    participant AG as agent.py
+    participant KB as knowledge.py
+    participant OL as Ollama (LLM)
+    participant LV as lua_validator
+    participant RV as runtime_validator
+
+    User->>UI: Task (RU/EN)
+    UI->>API: POST /session/{id}/message
+
+    alt First message in session
+        API->>CL: analyze(prompt)
+        CL->>OL: LLM call (JSON mode, 80 tokens)
+        OL-->>CL: {needs_clarification, question}
+        alt Ambiguous task
+            CL-->>API: needs_clarification=true
+            API-->>UI: {kind: "clarification", question: "..."}
+            User->>UI: Answer
+            UI->>API: {is_clarification_answer: true}
+        end
+    end
+
+    API->>AG: generate(prompt, previous_code?, schema?)
+    AG->>OL: Plan call (120 tokens)
+    OL-->>AG: Plan text
+    AG->>KB: select_examples(prompt, k=2)
+    KB-->>AG: top-2 examples
+    AG->>KB: build_system_prompt + build_user_prompt(plan, schema)
+    AG->>OL: Code call (256 tokens)
+    OL-->>AG: Raw response
+    AG->>LV: extract_lua_code + validate_lua (luac -p)
+    AG->>RV: validate_runtime (lua sandbox)
+
+    alt Validation fails
+        AG->>OL: Retry with error feedback (T=0.5)
+        OL-->>AG: Fixed code
+        AG->>LV: re-validate
+        AG->>RV: re-validate
+    end
+
+    AG-->>API: GenerateResult(code, plan, retries, ...)
+    API-->>UI: {kind: "code", code, plan, ...}
+    UI-->>User: Plan + Code + Telemetry
 ```
 
 ---
 
 ## Связь диаграмм с хакатонными ограничениями (резюме)
 
-| Ограничение жюри | Как решает архитектура | Где видно на диаграмме |
+| Ограничение жюри | Как решает архитектура | Где видно |
 |---|---|---|
-| 100 % локальное исполнение, без облаков | Единый `docker compose`, все контейнеры локальные, `luac` — дочерний процесс | **Уровень 2**: отсутствие внешних систем за границей `System_Boundary` |
-| VRAM ≤ 8 ГБ | Квантованная Q4-модель (~4.7 ГБ) + `OLLAMA_NUM_PARALLEL=1` + BM25 top-2 + token-budget guard | **Уровень 2**: `ollama` с GPU; **Уровень 3**: `knowledge.py` с защитой бюджета |
-| Автономная самокоррекция | Агентный цикл `generate → validate → retry` с ростом температуры и накоплением истории | **Уровень 3**: стрелки `agent → validator → agent → ollama_client` |
-| Изоляция / тестируемость | HTTP живёт только в `ollama_client.py`, subprocess только в `lua_validator.py` | **Уровень 3**: только эти два компонента имеют `Rel` к `System_Ext` |
+| 100 % локальное исполнение | Единый `docker compose`, нет внешних API | Уровень 2: нет систем за границей |
+| VRAM ≤ 8 ГБ | Q4 (~4.7 ГБ) + `PARALLEL=1` + BM25 top-2 + token guard + `BASE_OPTIONS` | Уровень 2: ollama; Уровень 3: knowledge + ollama_client |
+| Агентность (≥ 1 итерация) | Clarifier → Planner → Coder → Validator → Self-correction → Multi-turn refinement | Уровень 3: все стрелки agent ↔ validator ↔ ollama |
+| Уточняющие вопросы | clarifier.py (JSON classifier, fail-open) | Уровень 3: main → clarifier |
+| Schema grounding | infer_schema(sample_wf_vars) | Уровень 3: agent → knowledge |
+| Lua 5.5 целевой | Модель инструктируется Lua 5.5, валидатор luac 5.4 (совместим) | Уровень 2: luac |

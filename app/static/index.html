@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LocalScript — Lua code assistant</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --user: #1f6feb;
+      --assistant: #238636;
+      --clarify: #d29922;
+      --error: #f85149;
+      --code-bg: #0b0f15;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; height: 100%; }
+    body { display: flex; flex-direction: column; }
+    header { padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    header h1 .logo { color: var(--accent); }
+    header .meta { color: var(--muted); font-size: 13px; }
+    header .meta a { color: var(--accent); text-decoration: none; margin-left: 14px; }
+    #chat { flex: 1; overflow-y: auto; padding: 24px 20px; max-width: 900px; width: 100%; margin: 0 auto; }
+    .turn { margin-bottom: 16px; }
+    .turn .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .turn.user .who { color: var(--user); }
+    .turn.assistant .who { color: var(--assistant); }
+    .turn.clarify .who { color: var(--clarify); }
+    .turn .bubble { padding: 12px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); white-space: pre-wrap; word-wrap: break-word; }
+    .turn.user .bubble { border-left: 3px solid var(--user); }
+    .turn.assistant .bubble { border-left: 3px solid var(--assistant); }
+    .turn.clarify .bubble { border-left: 3px solid var(--clarify); background: #2d2416; }
+    pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 10px; margin: 6px 0 0; overflow-x: auto; font-family: "JetBrains Mono", "Fira Code", monospace; font-size: 13px; color: #e6edf3; }
+    .plan { background: #1a1e28; border: 1px solid #30365d; border-radius: 4px; padding: 8px 10px; margin: 4px 0; font-size: 12px; color: #a5b4cf; white-space: pre-wrap; }
+    .plan-label { font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+    .telemetry { font-size: 11px; color: var(--muted); margin-top: 6px; display: flex; flex-wrap: wrap; gap: 12px; }
+    .telemetry span strong { color: var(--text); }
+    .status-ok { color: var(--assistant); }
+    .status-ok_after_retry { color: var(--clarify); }
+    .status-exhausted { color: var(--error); }
+    footer { padding: 14px 20px; background: var(--panel); border-top: 1px solid var(--border); }
+    footer .wrap { max-width: 900px; margin: 0 auto; display: flex; gap: 10px; }
+    textarea { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-size: 14px; font-family: inherit; resize: none; min-height: 44px; max-height: 120px; }
+    textarea:focus { outline: none; border-color: var(--accent); }
+    button { background: var(--user); color: white; border: none; padding: 10px 18px; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #388bfd; }
+    button:disabled { background: #30363d; cursor: not-allowed; }
+    .empty { color: var(--muted); text-align: center; padding: 60px 20px; }
+    .empty h2 { color: var(--text); margin-bottom: 8px; }
+    .pending { color: var(--muted); font-style: italic; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span class="logo">◆</span> LocalScript</h1>
+    <div class="meta">
+      <span id="vram-meta">VRAM: —</span>
+      <a href="/docs" target="_blank">API docs</a>
+      <a href="/metrics" target="_blank">Metrics</a>
+      <a href="#" id="new-session">New session</a>
+    </div>
+  </header>
+  <main id="chat">
+    <div class="empty" id="empty">
+      <h2>Lua code assistant</h2>
+      <p>Type a task in Russian or English. The system will plan the approach,
+      generate Lua 5.5 code, validate it (syntax + runtime), and self-correct
+      if something is wrong. It may ask a clarifying question if the task is
+      ambiguous. Follow-up messages refine the previous code.</p>
+      <p style="font-size: 12px;">Examples: <em>"Return the last email from wf.vars.emails"</em>,
+      <em>"Просуммируй wf.vars.items"</em>, then <em>"add nil check"</em></p>
+    </div>
+  </main>
+  <footer>
+    <div class="wrap">
+      <textarea id="input" placeholder="Describe the Lua logic you need…" autofocus></textarea>
+      <button id="send">Send</button>
+    </div>
+  </footer>
+
+  <script>
+    let sessionId = null;
+    let waitingForClarification = false;
+
+    const chat = document.getElementById('chat');
+    const empty = document.getElementById('empty');
+    const input = document.getElementById('input');
+    const sendBtn = document.getElementById('send');
+    const vramMeta = document.getElementById('vram-meta');
+    const newSessionBtn = document.getElementById('new-session');
+
+    async function startSession() {
+      const r = await fetch('/session/start', { method: 'POST' });
+      const data = await r.json();
+      sessionId = data.session_id;
+      waitingForClarification = false;
+    }
+
+    function addTurn(role, content, telemetry) {
+      if (empty) empty.remove();
+      const turn = document.createElement('div');
+      turn.className = 'turn ' + role;
+      const who = document.createElement('div');
+      who.className = 'who';
+      who.textContent = role === 'user' ? 'You' : (role === 'clarify' ? 'Clarification' : 'Assistant');
+      turn.appendChild(who);
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      if (role === 'assistant' && telemetry && telemetry.code) {
+        if (telemetry.plan) {
+          const planLabel = document.createElement('div');
+          planLabel.className = 'plan-label';
+          planLabel.textContent = 'Plan';
+          bubble.appendChild(planLabel);
+          const planDiv = document.createElement('div');
+          planDiv.className = 'plan';
+          planDiv.textContent = telemetry.plan;
+          bubble.appendChild(planDiv);
+        }
+        const pre = document.createElement('pre');
+        pre.textContent = telemetry.code;
+        bubble.appendChild(pre);
+        const tel = document.createElement('div');
+        tel.className = 'telemetry';
+        tel.innerHTML = `
+          <span>status: <strong class="status-${telemetry.status}">${telemetry.status}</strong></span>
+          <span>retries: <strong>${telemetry.retries}</strong></span>
+          <span>LLM: <strong>${telemetry.llm_ms}ms</strong></span>
+          <span>validate: <strong>${telemetry.validation_ms}ms</strong></span>
+          <span>examples: <strong>${(telemetry.examples_used || []).join(', ')}</strong></span>
+        `;
+        bubble.appendChild(tel);
+      } else {
+        bubble.textContent = content;
+      }
+      turn.appendChild(bubble);
+      chat.appendChild(turn);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    async function send() {
+      const text = input.value.trim();
+      if (!text) return;
+      if (!sessionId) await startSession();
+      addTurn('user', text);
+      input.value = '';
+      sendBtn.disabled = true;
+      sendBtn.textContent = 'Thinking…';
+
+      try {
+        const r = await fetch(`/session/${sessionId}/message`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: text,
+            is_clarification_answer: waitingForClarification,
+          }),
+        });
+        const data = await r.json();
+
+        if (data.kind === 'clarification') {
+          addTurn('clarify', data.question);
+          waitingForClarification = true;
+        } else {
+          addTurn('assistant', '', data);
+          waitingForClarification = false;
+        }
+      } catch (e) {
+        addTurn('clarify', 'Error: ' + (e && e.message ? e.message : e));
+      } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Send';
+        input.focus();
+        refreshMetrics();
+      }
+    }
+
+    async function refreshMetrics() {
+      try {
+        const r = await fetch('/metrics');
+        if (!r.ok) return;
+        const m = await r.json();
+        if (m.vram_used_mb != null) {
+          const compliant = m.vram_compliant ? '✔' : '✗';
+          vramMeta.textContent = `VRAM ${m.vram_used_mb}/${m.vram_total_mb} MB (peak ${m.vram_peak_mb || '?'} MB ${compliant})`;
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    sendBtn.addEventListener('click', send);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        send();
+      }
+    });
+    newSessionBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      await startSession();
+      chat.innerHTML = '';
+      const div = document.createElement('div');
+      div.className = 'empty';
+      div.innerHTML = '<h2>New session</h2><p>Start a fresh conversation.</p>';
+      chat.appendChild(div);
+    });
+
+    refreshMetrics();
+    setInterval(refreshMetrics, 5000);
+  </script>
+</body>
+</html>
